@@ -1,0 +1,13 @@
+{application, nifnet,
+ [
+  {description, "NIF based socket interface"},
+  {vsn, "1"},
+  {registered, []},
+  {applications, [
+                  kernel,
+                  stdlib
+                 ]},
+  {mod, { nifnet_app, []}},
+  {env, []}
+]}.
+
