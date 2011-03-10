@@ -74,6 +74,8 @@ typedef struct _nifnet_socket
 {
     int fd;
     ev_io io;
+    ev_timer timer;
+    int timeout;
     nifnet_context * ctx;
     socket_state state;
     int to_recv;
@@ -94,13 +96,20 @@ typedef struct _nifnet_msg
     enif_make_tuple2(env, enif_make_atom(env, "error"),\
                           enif_make_int(env, err))
 #define OK_TUPLE(r) enif_make_tuple2(env, enif_make_atom(env, "ok"), r)
-#define ATOM(a) enif_make_atom(env, a)
 #define IPC(ctx, mtype, handle) do { \
         nifnet_msg msg; \
         msg.type = mtype; \
         msg.socket = handle; \
         send(ctx->ipc_push, &msg, sizeof(msg), 0); \
     } while (0)
+#define SOCKINIT(s, context, fildes, state_) do { \
+        s->timeout = -1; \
+        s->fd = fildes; \
+        s->ctx = context; \
+        s->state = state_; \
+        BUFINIT(handle->recv_buf); \
+        BUFALLOC(handle->recv_buf, BUFSIZE); \
+        BUFINIT(handle->send_buf); } while (0)
 
 // Prototypes
 #define NIF(name) ERL_NIF_TERM name(ErlNifEnv* env, int argc,\
@@ -123,7 +132,7 @@ static ErlNifFunc nif_funcs[] =
     {"send", 2, nifnet_send},
     {"recv", 2, nifnet_recv},
     {"listen", 3, nifnet_listen},
-    {"accept", 1, nifnet_accept},
+    {"accept", 2, nifnet_accept},
     {"close", 1, nifnet_close},
 };
 
@@ -311,12 +320,7 @@ NIF(nifnet_connect)
     nifnet_socket * handle = enif_alloc_resource(nifnet_resource_socket,
                                                    sizeof(nifnet_socket));
 
-    handle->fd = sock;
-    handle->ctx = ctx;
-    handle->state = CONNECTED;
-    BUFINIT(handle->recv_buf);
-    BUFALLOC(handle->recv_buf, BUFSIZE);
-    BUFINIT(handle->send_buf);
+    SOCKINIT(handle, ctx, sock, CONNECTED);
 
     IPC(ctx, REGISTER_SOCKET, handle);
 
@@ -395,9 +399,17 @@ NIF(nifnet_accept)
         return enif_make_badarg(env);
     }
 
+    int timeout;
+    if (enif_is_atom(env, argv[1])) {
+        timeout = -1;
+    } else if (!enif_get_int(env, argv[1], &timeout)) {
+        return enif_make_badarg(env);
+    }
+
     int conn;
     if ((conn = accept(socket->fd, NULL, NULL)) < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            socket->timeout = timeout;
             enif_self(env, &socket->recver_pid);
             IPC(socket->ctx, DEFERRED_ACCEPT, socket);
             return enif_make_atom(env, "deferred");
@@ -407,12 +419,7 @@ NIF(nifnet_accept)
     nifnet_socket * handle = enif_alloc_resource(nifnet_resource_socket,
                                                    sizeof(nifnet_socket));
 
-    handle->fd = conn;
-    handle->ctx = socket->ctx;
-    handle->state = CONNECTED;
-    BUFINIT(handle->recv_buf);
-    BUFALLOC(handle->recv_buf, BUFSIZE);
-    BUFINIT(handle->send_buf);
+    SOCKINIT(handle, socket->ctx, conn, CONNECTED);
 
     socket_set_blocking(handle->fd, 0);
 
@@ -578,12 +585,7 @@ static void accept_event_cb(struct ev_loop *loop, ev_io *w, int revents)
                     enif_alloc_resource(nifnet_resource_socket,
                                         sizeof(nifnet_socket));
 
-        handle->fd = conn;
-        handle->ctx = socket->ctx;
-        handle->state = CONNECTED;
-        BUFINIT(handle->recv_buf);
-        BUFALLOC(handle->recv_buf, BUFSIZE);
-        BUFINIT(handle->send_buf);
+        SOCKINIT(handle, socket->ctx, conn, CONNECTED);
 
         socket_set_blocking(handle->fd, 0);
 
@@ -595,10 +597,34 @@ static void accept_event_cb(struct ev_loop *loop, ev_io *w, int revents)
                                        enif_make_resource(env, handle));
 
     }
+    if (socket->timeout >= 0) {
+        ev_timer_stop(loop, &socket->timer);
+        socket->timeout = -1;
+    }
     enif_send(NULL, &socket->recver_pid, env, result);
     enif_free_env(env);
     ev_io_stop(loop, w);
     ev_io_set(w, socket->fd, w->events & (~EV_READ));
+}
+
+static void timer_event_cb(struct ev_loop *loop, ev_timer *w, int revents)
+{
+    nifnet_socket * socket = (nifnet_socket *)w->data;
+    if (revents & EV_TIMER) {
+        if (socket->timeout == -1) {
+            return;
+        }
+        ev_io_stop(loop, &socket->io);
+        ev_io_set(&socket->io, socket->fd, socket->io.events & (~EV_READ));
+        ev_io_start(loop, &socket->io);
+        ev_timer_stop(loop, w);
+        socket->timeout = -1;
+        ErlNifEnv * env = enif_alloc_env();
+        enif_send(NULL, &socket->recver_pid, env,
+                  enif_make_tuple2(env, enif_make_atom(env, "deferred_error"),
+                                        enif_make_atom(env, "timeout")));
+        enif_free_env(env);
+    }
 }
 
 static void ipc_event_cb(struct ev_loop *loop, ev_io *w, int revents)
@@ -642,6 +668,12 @@ static void ipc_event_cb(struct ev_loop *loop, ev_io *w, int revents)
             ev_io_set(&msg.socket->io, msg.socket->fd,
                       msg.socket->io.events | EV_READ);
             ev_io_start(loop, &msg.socket->io);
+            if (&msg.socket->timeout >= 0) {
+                ev_timer_init(&msg.socket->timer, timer_event_cb,
+                              msg.socket->timeout/1000., 0.);
+                msg.socket->timer.data = msg.socket;
+                ev_timer_start(loop, &msg.socket->timer);
+            }
             break;
         case DEFERRED_SEND:
             ev_io_stop(loop, &msg.socket->io);

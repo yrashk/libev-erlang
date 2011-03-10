@@ -1,6 +1,6 @@
 -module(nifnet).
 -export([start/0, stop/1, connect/3, send/2, recv/2, listen/2, listen/3,
-         accept/1, close/1]).
+         accept/1, accept/2, close/1]).
 
 start() ->
     nifnet_nif:start().
@@ -48,7 +48,10 @@ listen(Ctx, Port, Backlog) ->
     nifnet_nif:listen(Ctx, Port, Backlog).
 
 accept(LSock) ->
-    case nifnet_nif:accept(LSock) of
+    accept(LSock, infinity).
+
+accept(LSock, Timeout) ->
+    case nifnet_nif:accept(LSock, Timeout) of
         deferred ->
             receive
                 {deferred_ok, Sock} ->

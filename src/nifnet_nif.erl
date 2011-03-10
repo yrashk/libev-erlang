@@ -1,7 +1,7 @@
 -module(nifnet_nif).
 
 -export([start/0,connect/3, send/2, recv/2, stop/1, listen/3,
-         accept/1, close/1]).
+         accept/2, close/1]).
 
 -on_load(init/0).
 
@@ -35,7 +35,7 @@ recv(_Sock, _Size) ->
 listen(_Ctx, _Port, _Backlog) ->
     erlang:nif_error(not_loaded).
 
-accept(_Sock) ->
+accept(_Sock, _Timeout) ->
     erlang:nif_error(not_loaded).
 
 close(_Sock) ->
