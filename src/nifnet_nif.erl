@@ -18,28 +18,28 @@ init() ->
     end.
 
 start() ->
-    "NIF library not loaded".
+    erlang:nif_error(not_loaded).
 
 stop(_Ref) ->
-    "NIF library not loaded".
+    erlang:nif_error(not_loaded).
 
 connect(_Ctx, _Ip, _Host) ->
-    "NIF library not loaded".
+    erlang:nif_error(not_loaded).
 
 send(_Sock, _Msg) ->
-    "NIF library not loaded".
+    erlang:nif_error(not_loaded).
 
 recv(_Sock, _Size) ->
-    "NIF library not loaded".
+    erlang:nif_error(not_loaded).
 
 listen(_Ctx, _Port, _Backlog) ->
-    "NIF library not loaded".
+    erlang:nif_error(not_loaded).
 
 accept(_Sock) ->
-    "NIF library not loaded".
+    erlang:nif_error(not_loaded).
 
 close(_Sock) ->
-    "NIF library not loaded".
+    erlang:nif_error(not_loaded).
 
 %% ===================================================================
 %% EUnit tests
