@@ -46,8 +46,7 @@ typedef struct _nifnet_context
 #define BUFCLEAR(b) while (b.data != NULL) { \
         free(b.data); \
         b.data = NULL; \
-        b.size = b.pos = 0; \
-    }
+        b.size = b.pos = 0; }
 #define BUFALLOC(b, s) do { \
         b.data = malloc(s); \
         b.size = s; \
@@ -683,13 +682,19 @@ void * event_loop(void * handle)
 
 static void nifnet_context_cleanup(ErlNifEnv* env, void* arg)
 {
-    //nifnet_context * context = (nifnet_context *)arg;
+    nifnet_context * ctx = (nifnet_context *)arg;
+    if (ctx->running) {
+        IPC(ctx, STOP, NULL);
+        enif_thread_join(ctx->event_loop_tid, NULL);
+    }
 }
 
 static void nifnet_socket_cleanup(ErlNifEnv* env, void* arg)
 {
     nifnet_socket * socket = (nifnet_socket *)arg;
-    close(socket->fd);
+    if (socket->fd != -1) {
+        close(socket->fd);
+    }
 }
 
 static int on_load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info)
