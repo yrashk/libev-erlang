@@ -474,10 +474,10 @@ static void socket_event_cb(struct ev_loop *loop, ev_io *w, int revents)
             int r = recv(socket->fd, BUFPTR(socket->recv_buf), BUFSIZE, 0);
             if (r == 0) {
                 // disconnected
+                ev_io_stop(loop, w);
+                close(socket->fd);
+                socket->fd = -1;
                 if (socket->recv_buf.pos > 0) {
-                    ev_io_stop(loop, w);
-                    close(socket->fd);
-                    socket->fd = -1;
                     goto return_buffer;
                 }
                 ErlNifEnv * env = enif_alloc_env();
