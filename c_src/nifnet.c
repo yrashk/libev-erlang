@@ -14,8 +14,9 @@ static ErlNifResourceType* nifnet_resource_context;
 static ErlNifResourceType* nifnet_resource_socket;
 
 typedef enum _ipc_msg_type {
-    STOP,
+    STOP_CONTEXT,
     REGISTER_SOCKET,
+    CLOSE_SOCKET,
     DEFERRED_SEND,
     DEFERRED_RECV,
     DEFERRED_ACCEPT,
@@ -175,7 +176,6 @@ NIF(nifnet_start)
     enif_mutex_unlock(handle->mutex);
 
     ERL_NIF_TERM result = enif_make_resource(env, handle);
-    enif_release_resource(handle);
 
     return OK_TUPLE(result);
 }
@@ -227,11 +227,9 @@ NIF(nifnet_recv) {
     int to_recv = wanted ? wanted : BUFSIZE;
     to_recv = MIN(to_recv, BUFSIZE);
 
-    //printf("wanted: %d, to_recv: %d\r\n", wanted, to_recv);
     void *data = enif_make_new_binary(env, to_recv, &result);
 
     int r = recv(socket->fd, data, to_recv, 0);
-    //printf("read %d\r\n", r);
     if ((r > 0 && wanted == 0) || (r == wanted)) {
         return enif_make_tuple2(env, enif_make_atom(env, "ok"), result);
     }
@@ -323,7 +321,6 @@ NIF(nifnet_connect)
     IPC(ctx, REGISTER_SOCKET, handle);
 
     ERL_NIF_TERM result = enif_make_resource(env, handle);
-    enif_release_resource(handle);
 
     return enif_make_tuple2(env, enif_make_atom(env, "ok"), result);
 }
@@ -380,7 +377,6 @@ NIF(nifnet_listen)
     IPC(ctx, REGISTER_SOCKET, handle);
 
     ERL_NIF_TERM result = enif_make_resource(env, handle);
-    enif_release_resource(handle);
 
     return enif_make_tuple2(env, enif_make_atom(env, "ok"), result);
 }
@@ -423,7 +419,6 @@ NIF(nifnet_accept)
     IPC(socket->ctx, REGISTER_SOCKET, handle);
 
     ERL_NIF_TERM result = enif_make_resource(env, handle);
-    enif_release_resource(handle);
 
     return enif_make_tuple2(env, enif_make_atom(env, "ok"), result);
 }
@@ -436,13 +431,13 @@ NIF(nifnet_close)
                                 (void **)&socket)) {
         return enif_make_badarg(env);
     }
+
+
     if (!socket->ctx->running) {
         return enif_make_badarg(env);
     }
-    if (socket->fd != -1) {
-        close(socket->fd);
-        socket->fd = -1;
-    }
+
+    IPC(socket->ctx, CLOSE_SOCKET, socket);
     return enif_make_atom(env, "ok");
 }
 
@@ -455,7 +450,9 @@ NIF(nifnet_stop)
         return enif_make_badarg(env);
     }
 
-    IPC(ctx, STOP, NULL);
+    IPC(ctx, STOP_CONTEXT, NULL);
+    enif_thread_join(ctx->event_loop_tid, NULL);
+    enif_release_resource(ctx);
 
     return enif_make_atom(env, "ok");
 }
@@ -597,7 +594,6 @@ static void accept_event_cb(struct ev_loop *loop, ev_io *w, int revents)
         result = enif_make_tuple2(env, enif_make_atom(env, "deferred_ok"),
                                        enif_make_resource(env, handle));
 
-        enif_release_resource(handle);
     }
     enif_send(NULL, &socket->recver_pid, env, result);
     enif_free_env(env);
@@ -611,7 +607,7 @@ static void ipc_event_cb(struct ev_loop *loop, ev_io *w, int revents)
     nifnet_msg msg;
     recv(ctx->ipc_pull, &msg, sizeof(msg), 0);
     switch (msg.type) {
-        case STOP:
+        case STOP_CONTEXT:
             ctx->running = 0;
             ev_break(loop, EVBREAK_ALL);
             break;
@@ -630,6 +626,16 @@ static void ipc_event_cb(struct ev_loop *loop, ev_io *w, int revents)
                     ev_io_start(loop, &msg.socket->io);
                     break;
             }
+            break;
+        case CLOSE_SOCKET:
+            ev_io_stop(loop, &msg.socket->io);
+            if (msg.socket->fd != -1) {
+                close(msg.socket->fd);
+                msg.socket->fd = -1;
+            }
+            BUFCLEAR(msg.socket->recv_buf);
+            BUFCLEAR(msg.socket->send_buf);
+            enif_release_resource(&msg.socket);
             break;
         case DEFERRED_ACCEPT:
             ev_io_stop(loop, &msg.socket->io);
@@ -654,7 +660,6 @@ static void ipc_event_cb(struct ev_loop *loop, ev_io *w, int revents)
 
 void * event_loop(void * handle)
 {
-    //printf("Starting event loop\n");
     nifnet_context * ctx = (nifnet_context *)handle;
 
     ctx->loop_ctx = ev_loop_new(EVFLAG_AUTO);
@@ -672,29 +677,10 @@ void * event_loop(void * handle)
     while (ctx->running) {
         ev_run(ctx->loop_ctx, 0);
     }
-
     ev_loop_destroy(ctx->loop_ctx);
     enif_mutex_destroy(ctx->mutex);
     enif_cond_destroy(ctx->cond);
-    //printf("event_loop stopped\n");
     return NULL;
-}
-
-static void nifnet_context_cleanup(ErlNifEnv* env, void* arg)
-{
-    nifnet_context * ctx = (nifnet_context *)arg;
-    if (ctx->running) {
-        IPC(ctx, STOP, NULL);
-        enif_thread_join(ctx->event_loop_tid, NULL);
-    }
-}
-
-static void nifnet_socket_cleanup(ErlNifEnv* env, void* arg)
-{
-    nifnet_socket * socket = (nifnet_socket *)arg;
-    if (socket->fd != -1) {
-        close(socket->fd);
-    }
 }
 
 static int on_load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info)
@@ -702,13 +688,13 @@ static int on_load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info)
     nifnet_resource_context =
         enif_open_resource_type(env, "nifnet_nif",
                                      "nifnet_resource_context",
-                                     &nifnet_context_cleanup,
+                                     NULL,
                                      ERL_NIF_RT_CREATE|ERL_NIF_RT_TAKEOVER,
                                      0);
     nifnet_resource_socket =
         enif_open_resource_type(env, "nifnet_nif",
                                      "nifnet_resource_socket",
-                                     &nifnet_socket_cleanup,
+                                     NULL,
                                      ERL_NIF_RT_CREATE|ERL_NIF_RT_TAKEOVER,
                                      0);
     return 0;
