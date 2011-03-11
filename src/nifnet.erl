@@ -1,6 +1,6 @@
 -module(nifnet).
 -export([start/0, stop/1, connect/3, send/2, recv/2, listen/2, listen/3,
-         accept/1, accept/2, close/1]).
+         accept/1, accept/2, shutdown/2, close/1]).
 
 start() ->
     nifnet_nif:start().
@@ -62,6 +62,13 @@ accept(LSock, Timeout) ->
         What ->
             What
     end.
+
+shutdown(Sock, read) ->
+    nifnet_nif:shutdown(Sock, 1);
+shutdown(Sock, write) ->
+    nifnet_nif:shutdown(Sock, 2);
+shutdown(Sock, read_write) ->
+    nifnet_nit:shutdown(Sock, 3).
 
 close(Sock) ->
     nifnet_nif:close(Sock).

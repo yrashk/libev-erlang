@@ -123,6 +123,7 @@ NIF(nifnet_recv);
 NIF(nifnet_listen);
 NIF(nifnet_accept);
 NIF(nifnet_close);
+NIF(nifnet_shutdown);
 
 static ErlNifFunc nif_funcs[] =
 {
@@ -134,6 +135,7 @@ static ErlNifFunc nif_funcs[] =
     {"listen", 3, nifnet_listen},
     {"accept", 2, nifnet_accept},
     {"close", 1, nifnet_close},
+    {"shutdown", 2, nifnet_shutdown},
 };
 
 // Helper functions
@@ -445,6 +447,44 @@ NIF(nifnet_close)
     }
 
     IPC(socket->ctx, CLOSE_SOCKET, socket);
+    return enif_make_atom(env, "ok");
+}
+
+NIF(nifnet_shutdown)
+{
+    nifnet_socket * socket;
+
+    if (!enif_get_resource(env, argv[0], nifnet_resource_socket,
+                                (void **)&socket)) {
+        return enif_make_badarg(env);
+    }
+
+    if (!socket->ctx->running) {
+        return enif_make_badarg(env);
+    }
+
+    int how;
+    if (!enif_get_int(env, argv[1], &how)) {
+        return enif_make_badarg(env);
+    }
+    switch (how) {
+        case 1:
+            how = SHUT_RD;
+            break;
+        case 2:
+            how = SHUT_WR;
+            break;
+        case 3:
+            how = SHUT_RDWR;
+            break;
+        default:
+            return enif_make_badarg(env);
+    }
+
+    if (shutdown(socket->fd, how) < 0) {
+        return ERROR_TUPLE(errno);
+    }
+
     return enif_make_atom(env, "ok");
 }
 
