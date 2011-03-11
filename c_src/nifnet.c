@@ -110,6 +110,10 @@ typedef struct _nifnet_msg
         BUFINIT(handle->recv_buf); \
         BUFALLOC(handle->recv_buf, BUFSIZE); \
         BUFINIT(handle->send_buf); } while (0)
+#define CANCEL_TIMER(l, s) do { \
+        if (s->timeout >= 0) { \
+            ev_timer_stop(l, &s->timer); \
+            s->timeout = -1; } } while (0)
 
 // Prototypes
 #define NIF(name) ERL_NIF_TERM name(ErlNifEnv* env, int argc,\
@@ -131,7 +135,7 @@ static ErlNifFunc nif_funcs[] =
     {"stop", 1, nifnet_stop},
     {"connect", 3, nifnet_connect},
     {"send", 2, nifnet_send},
-    {"recv", 2, nifnet_recv},
+    {"recv", 3, nifnet_recv},
     {"listen", 3, nifnet_listen},
     {"accept", 2, nifnet_accept},
     {"close", 1, nifnet_close},
@@ -234,6 +238,13 @@ NIF(nifnet_recv) {
         enif_make_badarg(env);
     }
 
+    int timeout;
+    if (enif_is_atom(env, argv[2])) {
+        timeout = -1;
+    } else if (!enif_get_int(env, argv[2], &timeout)) {
+        return enif_make_badarg(env);
+    }
+
     ERL_NIF_TERM result;
     int to_recv = wanted ? wanted : BUFSIZE;
     to_recv = MIN(to_recv, BUFSIZE);
@@ -241,12 +252,12 @@ NIF(nifnet_recv) {
     void *data = enif_make_new_binary(env, to_recv, &result);
 
     int r = recv(socket->fd, data, to_recv, 0);
-    if ((r > 0 && wanted == 0) || (r == wanted)) {
-        return enif_make_tuple2(env, enif_make_atom(env, "ok"), result);
-    }
     if (r == 0) {
         return enif_make_tuple2(env, enif_make_atom(env, "error"),
                                      enif_make_atom(env, "disconnected"));
+    }
+    if ((r > 0 && wanted == 0) || (r == wanted)) {
+        return enif_make_tuple2(env, enif_make_atom(env, "ok"), result);
     }
     if (r > 0) {
         int avail = BUFAVAIL(socket->recv_buf);
@@ -261,6 +272,7 @@ NIF(nifnet_recv) {
     return enif_make_tuple2(env, enif_make_atom(env, "error"),
                                  enif_make_int(env, errno));
 deferred:
+    socket->timeout = timeout;
     socket->to_recv = wanted;
     enif_self(env, &socket->recver_pid);
     IPC(socket->ctx, DEFERRED_RECV, socket);
@@ -517,6 +529,7 @@ static void socket_event_cb(struct ev_loop *loop, ev_io *w, int revents)
             int r = recv(socket->fd, BUFPTR(socket->recv_buf), BUFSIZE, 0);
             if (r == 0) {
                 // disconnected
+                CANCEL_TIMER(loop, socket);
                 ev_io_stop(loop, w);
                 close(socket->fd);
                 socket->fd = -1;
@@ -538,8 +551,12 @@ static void socket_event_cb(struct ev_loop *loop, ev_io *w, int revents)
                 }
             } else {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    goto return_buffer;
+                    if (socket->to_recv == 0) {
+                        goto return_buffer;
+                    }
+                    goto out;
                 }
+                CANCEL_TIMER(loop, socket);
                 ErlNifEnv * env = enif_alloc_env();
                 enif_send(NULL, &socket->recver_pid, env,
                           enif_make_tuple2(env,
@@ -550,6 +567,7 @@ static void socket_event_cb(struct ev_loop *loop, ev_io *w, int revents)
             }
         }
 return_buffer:
+        CANCEL_TIMER(loop, socket);
         env = enif_alloc_env();
         memcpy(enif_make_new_binary(env, socket->recv_buf.pos, &result),
                socket->recv_buf.data, socket->recv_buf.pos);
@@ -637,10 +655,7 @@ static void accept_event_cb(struct ev_loop *loop, ev_io *w, int revents)
                                        enif_make_resource(env, handle));
 
     }
-    if (socket->timeout >= 0) {
-        ev_timer_stop(loop, &socket->timer);
-        socket->timeout = -1;
-    }
+    CANCEL_TIMER(loop, socket);
     enif_send(NULL, &socket->recver_pid, env, result);
     enif_free_env(env);
     ev_io_stop(loop, w);
@@ -726,6 +741,12 @@ static void ipc_event_cb(struct ev_loop *loop, ev_io *w, int revents)
             ev_io_set(&msg.socket->io, msg.socket->fd,
                       msg.socket->io.events | EV_READ);
             ev_io_start(loop, &msg.socket->io);
+            if (&msg.socket->timeout >= 0) {
+                ev_timer_init(&msg.socket->timer, timer_event_cb,
+                              msg.socket->timeout/1000., 0.);
+                msg.socket->timer.data = msg.socket;
+                ev_timer_start(loop, &msg.socket->timer);
+            }
             break;
     }
 }

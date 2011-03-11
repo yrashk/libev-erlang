@@ -1,6 +1,6 @@
 -module(nifnet).
--export([start/0, stop/1, connect/3, send/2, recv/2, listen/2, listen/3,
-         accept/1, accept/2, shutdown/2, close/1]).
+-export([start/0, stop/1, connect/3, send/2, recv/2, recv/3,
+         listen/2, listen/3, accept/1, accept/2, shutdown/2, close/1]).
 
 start() ->
     nifnet_nif:start().
@@ -30,7 +30,10 @@ send(Sock, Msg) ->
     end.
 
 recv(Sock, Size) ->
-    case nifnet_nif:recv(Sock, Size) of
+    recv(Sock, Size, infinity).
+
+recv(Sock, Size, Timeout) ->
+    case nifnet_nif:recv(Sock, Size, Timeout) of
         deferred ->
             receive
                 {deferred_ok, Data} ->

@@ -1,6 +1,6 @@
 -module(nifnet_nif).
 
--export([start/0,connect/3, send/2, recv/2, stop/1, listen/3,
+-export([start/0,connect/3, send/2, recv/3, stop/1, listen/3,
          accept/2, shutdown/2, close/1]).
 
 -on_load(init/0).
@@ -29,7 +29,7 @@ connect(_Ctx, _Ip, _Host) ->
 send(_Sock, _Msg) ->
     erlang:nif_error(not_loaded).
 
-recv(_Sock, _Size) ->
+recv(_Sock, _Size, _Timeout) ->
     erlang:nif_error(not_loaded).
 
 listen(_Ctx, _Port, _Backlog) ->
