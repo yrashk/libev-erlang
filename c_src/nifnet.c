@@ -245,9 +245,11 @@ NIF(nifnet_recv) {
         return enif_make_badarg(env);
     }
 
+    if (wanted == 0)
+        goto deferred;
+
     ERL_NIF_TERM result;
-    int to_recv = wanted ? wanted : BUFSIZE;
-    to_recv = MIN(to_recv, BUFSIZE);
+    int to_recv = MIN(wanted, BUFSIZE);
 
     void *data = enif_make_new_binary(env, to_recv, &result);
 
@@ -256,7 +258,7 @@ NIF(nifnet_recv) {
         return enif_make_tuple2(env, enif_make_atom(env, "error"),
                                      enif_make_atom(env, "disconnected"));
     }
-    if ((r > 0 && wanted == 0) || (r == wanted)) {
+    if (r == wanted) {
         return enif_make_tuple2(env, enif_make_atom(env, "ok"), result);
     }
     if (r > 0) {
@@ -329,12 +331,13 @@ NIF(nifnet_connect)
         close(sock);
         return ERROR_TUPLE(errno);
     }
-    socket_set_blocking(sock, 0);
 
     nifnet_socket * handle = enif_alloc_resource(nifnet_resource_socket,
                                                    sizeof(nifnet_socket));
 
     SOCKINIT(handle, ctx, sock, CONNECTED);
+
+    socket_set_blocking(sock, 0);
 
     IPC(ctx, REGISTER_SOCKET, handle);
 
@@ -516,112 +519,126 @@ NIF(nifnet_stop)
     return enif_make_atom(env, "ok");
 }
 
+static void socket_handle_read(nifnet_socket * socket)
+{
+    ERL_NIF_TERM result;
+    ErlNifEnv * env;
+    struct ev_loop * loop = socket->ctx->loop_ctx;
+    int recvd = 0;
+    do {
+        int avail = BUFAVAIL(socket->recv_buf);
+        if (avail < BUFSIZE)
+            BUFEXTEND(socket->recv_buf, BUFSIZE-avail);
+        int r = recv(socket->fd, BUFPTR(socket->recv_buf), BUFSIZE, 0);
+        if (r == 0) {
+            // disconnected
+            CANCEL_TIMER(loop, socket);
+            ev_io_stop(loop, &socket->io);
+            close(socket->fd);
+            socket->fd = -1;
+            BUFCLEAR(socket->recv_buf);
+            env = enif_alloc_env();
+            enif_send(NULL, &socket->recver_pid, env,
+                      enif_make_tuple2(env,
+                                   enif_make_atom(env, "deferred_error"),
+                                   enif_make_atom(env, "disconnected")));
+            enif_free_env(env);
+            return;
+        }
+        if (r > 0) {
+            socket->recv_buf.pos += r;
+            recvd += r;
+            if (socket->to_recv > 0 &&
+                socket->recv_buf.pos >= socket->to_recv) {
+                break;
+            }
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // we've received all that could be
+            if (socket->to_recv == 0) {
+                break;
+            }
+            return;
+        }
+        CANCEL_TIMER(loop, socket);
+        env = enif_alloc_env();
+        enif_send(NULL, &socket->recver_pid, env,
+                  enif_make_tuple2(env,
+                                   enif_make_atom(env, "deferred_error"),
+                                   enif_make_int(env, errno)));
+        enif_free_env(env);
+        return;
+    } while (1);
+    // } while (recvd < SOME_LIMIT); to avoid event loop starvation
+    CANCEL_TIMER(loop, socket);
+    env = enif_alloc_env();
+    memcpy(enif_make_new_binary(env, socket->recv_buf.pos, &result),
+           socket->recv_buf.data, socket->recv_buf.pos);
+    enif_send(NULL, &socket->recver_pid, env,
+              enif_make_tuple2(env, enif_make_atom(env, "deferred_ok"),
+                                    result));
+    enif_free_env(env);
+    socket->recv_buf.pos = 0;
+    ev_io_stop(loop, &socket->io);
+    ev_io_set(&socket->io, socket->fd, socket->io.events & (~EV_READ));
+    ev_io_start(loop, &socket->io);
+}
+
+static void socket_handle_write(nifnet_socket *socket)
+{
+    ErlNifEnv * env;
+    struct ev_loop * loop = socket->ctx->loop_ctx;
+    if (socket->send_buf.size > 0) {
+        int n, to_send;
+        int sent;
+        do {
+            to_send = MIN(BUFAVAIL(socket->send_buf), BUFSIZE);
+            if (to_send == 0) {
+                ev_io_stop(loop, &socket->io);
+                ev_io_set(&socket->io, socket->fd,
+                          socket->io.events & (~EV_WRITE));
+                ev_io_start(loop, &socket->io);
+                BUFCLEAR(socket->send_buf);
+                env = enif_alloc_env();
+                enif_send(NULL, &socket->sender_pid, env,
+                          enif_make_atom(env, "deferred_ok"));
+                enif_free_env(env);
+                return;
+            }
+            n = send(socket->fd, BUFPTR(socket->send_buf), to_send, 0);
+            if (n > 0) {
+                socket->send_buf.pos += n;
+                sent += n;
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // finish later
+                return;
+            } else {
+                ev_io_stop(loop, &socket->io);
+                ev_io_set(&socket->io, socket->fd,
+                          socket->io.events & (~EV_WRITE));
+                ev_io_start(loop, &socket->io);
+                env = enif_alloc_env();
+                enif_send(NULL, &socket->sender_pid, env,
+                          enif_make_tuple2(env,
+                                    enif_make_atom(env, "deferred_error"),
+                                    enif_make_int(env, errno)));
+                enif_free_env(env);
+                return;
+            }
+        } while (1);
+        // } while (sent < SOME_LIMIT); to avoid event loop starvation
+    }
+}
+
 static void socket_event_cb(struct ev_loop *loop, ev_io *w, int revents)
 {
     nifnet_socket * socket = (nifnet_socket *)w->data;
     if (revents & EV_READ) {
-        ERL_NIF_TERM result;
-        ErlNifEnv * env;
-        while (1) {
-            int avail = BUFAVAIL(socket->recv_buf);
-            if (avail < BUFSIZE)
-                BUFEXTEND(socket->recv_buf, BUFSIZE-avail);
-            int r = recv(socket->fd, BUFPTR(socket->recv_buf), BUFSIZE, 0);
-            if (r == 0) {
-                // disconnected
-                CANCEL_TIMER(loop, socket);
-                ev_io_stop(loop, w);
-                close(socket->fd);
-                socket->fd = -1;
-                if (socket->recv_buf.pos > 0) {
-                    goto return_buffer;
-                }
-                ErlNifEnv * env = enif_alloc_env();
-                enif_send(NULL, &socket->recver_pid, env,
-                          enif_make_tuple2(env,
-                                   enif_make_atom(env, "deferred_error"),
-                                   enif_make_atom(env, "disconnected")));
-                enif_free_env(env);
-                goto out;
-            } else if (r > 0) {
-                socket->recv_buf.pos += r;
-                if (socket->to_recv > 0 &&
-                    socket->recv_buf.pos >= socket->to_recv) {
-                    goto return_buffer;
-                }
-            } else {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    if (socket->to_recv == 0) {
-                        goto return_buffer;
-                    }
-                    goto out;
-                }
-                CANCEL_TIMER(loop, socket);
-                ErlNifEnv * env = enif_alloc_env();
-                enif_send(NULL, &socket->recver_pid, env,
-                          enif_make_tuple2(env,
-                                       enif_make_atom(env, "deferred_error"),
-                                       enif_make_int(env, errno)));
-                enif_free_env(env);
-                goto out;
-            }
-        }
-return_buffer:
-        CANCEL_TIMER(loop, socket);
-        env = enif_alloc_env();
-        memcpy(enif_make_new_binary(env, socket->recv_buf.pos, &result),
-               socket->recv_buf.data, socket->recv_buf.pos);
-        enif_send(NULL, &socket->recver_pid, env,
-                  enif_make_tuple2(env, enif_make_atom(env, "deferred_ok"),
-                                        result));
-        enif_free_env(env);
-        socket->recv_buf.pos = 0;
-        ev_io_stop(loop, w);
-        ev_io_set(w, socket->fd, w->events & (~EV_READ));
-        ev_io_start(loop, w);
+        socket_handle_read(socket);
     }
-out:
     if (revents & EV_WRITE) {
-        if (socket->send_buf.size > 0) {
-            int n, to_send;
-            int sent;
-            do {
-                to_send = MIN(BUFAVAIL(socket->send_buf), BUFSIZE);
-                if (to_send == 0) {
-                    ev_io_stop(loop, w);
-                    ev_io_set(&socket->io, socket->fd,
-                              socket->io.events & (~EV_WRITE));
-                    ev_io_start(loop, w);
-                    BUFCLEAR(socket->send_buf);
-                    ErlNifEnv* env = enif_alloc_env();
-                    enif_send(NULL, &socket->sender_pid, env,
-                              enif_make_atom(env, "deferred_ok"));
-                    enif_free_env(env);
-                    break;
-                }
-                n = send(socket->fd, BUFPTR(socket->send_buf), to_send, 0);
-                if (n > 0) {
-                    socket->send_buf.pos += n;
-                    sent += n;
-                } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    // finish later
-                    break;
-                } else {
-                    ev_io_stop(loop, w);
-                    ev_io_set(&socket->io, socket->fd,
-                              socket->io.events & (~EV_WRITE));
-                    ev_io_start(loop, w);
-                    ErlNifEnv * env = enif_alloc_env();
-                    enif_send(NULL, &socket->sender_pid, env,
-                              enif_make_tuple2(env,
-                                        enif_make_atom(env, "deferred_error"),
-                                        enif_make_int(env, errno)));
-                    enif_free_env(env);
-                    break;
-                }
-            } while (1);
-            // } while (sent < SOME_LIMIT); to avoid loop starvation
-        }
+        socket_handle_write(socket);
     }
 }
 
